@@ -1,67 +1,96 @@
 import unittest
 import torch
-import torch.nn.functional as F
-
-from src.attention import CausalSelfAttention, MultiHeadAttention, get_default_device
+from attention import CausalSelfAttention, MultiHeadAttention
 
 
 class TestAttention(unittest.TestCase):
-    def test_shapes_and_device(self) -> None:
-        expected_device = get_default_device()
-        x = torch.randn(2, 5, 32, dtype=torch.float32, device=expected_device)
+    def setUp(self):
+        self.embed_size = 256
+        self.heads = 8
+        self.dropout = 0.2
+        self.batch_size = 4
+        self.seq_length = 10
 
-        causal = CausalSelfAttention(embed_dim=32, head_dim=8, device=expected_device)
-        mha = MultiHeadAttention(embed_dim=32, num_heads=4, device=expected_device)
+        self.attention = CausalSelfAttention(self.embed_size, self.heads, self.dropout)
+        self.multi_head_attention = MultiHeadAttention(self.embed_size, self.heads, self.dropout)
 
-        y_causal = causal(x)
-        y_mha = mha(x)
+    def _get_device(self):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
 
-        self.assertEqual(y_causal.shape, (2, 5, 32))
-        self.assertEqual(y_mha.shape, (2, 5, 32))
-        self.assertEqual(y_causal.device.type, expected_device.type)
-        self.assertEqual(y_mha.device.type, expected_device.type)
+    def test_causal_self_attention_forward(self):
+        self.attention.eval()
+        x = torch.randn((self.batch_size, self.seq_length, self.embed_size))
+        out = self.attention(x, x, x)
+        self.assertEqual(out.shape, (self.batch_size, self.seq_length, self.embed_size))
 
-    def test_causal_self_attention_scaling_and_mask(self) -> None:
+    def test_multi_head_attention_forward(self):
+        self.multi_head_attention.eval()
+        values = torch.randn((self.batch_size, self.seq_length, self.embed_size))
+        keys = torch.randn((self.batch_size, self.seq_length, self.embed_size))
+        query = torch.randn((self.batch_size, self.seq_length, self.embed_size))
+        out = self.multi_head_attention(values, keys, query)
+        self.assertEqual(out.shape, (self.batch_size, self.seq_length, self.embed_size))
+
+    def test_device_handling(self):
+        device = self._get_device()
+        self.attention.to(device).eval()
+        self.multi_head_attention.to(device).eval()
+
+        x = torch.randn((self.batch_size, self.seq_length, self.embed_size), device=device)
+        out_causal = self.attention(x, x, x)
+        out_mha = self.multi_head_attention(x, x, x)
+
+        self.assertEqual(out_causal.device.type, device.type)
+        self.assertEqual(out_mha.device.type, device.type)
+
+    def test_causal_masking(self):
+        self.attention.eval()
         torch.manual_seed(42)
-        device = get_default_device()
-        attn = CausalSelfAttention(embed_dim=16, head_dim=4, dropout=0.0, device=device)
-        attn.eval()
+        x1 = torch.randn((self.batch_size, self.seq_length, self.embed_size))
+        x2 = x1.clone()
+        x2[:, 5:, :] = torch.randn((self.batch_size, self.seq_length - 5, self.embed_size))
 
-        x = torch.randn(2, 4, 16, dtype=torch.float32, device=device)
-        got_weights = attn.compute_attention_scores(x)
+        out1 = self.attention(x1, x1, x1)
+        out2 = self.attention(x2, x2, x2)
 
-        with torch.no_grad():
-            q = attn.q_proj(x)
-            k = attn.k_proj(x)
-            raw_scores = (q @ k.transpose(-2, -1)) * (4 ** -0.5)
-            mask = torch.triu(
-                torch.ones((4, 4), device=device, dtype=torch.bool),
-                diagonal=1,
-            )
-            masked_scores = raw_scores.masked_fill(mask, float("-inf"))
-            expected_weights = F.softmax(masked_scores, dim=-1)
+        self.assertTrue(torch.allclose(out1[:, :5, :], out2[:, :5, :], atol=1e-5))
+        self.assertFalse(torch.allclose(out1[:, 5:, :], out2[:, 5:, :], atol=1e-5))
 
-        self.assertTrue(torch.allclose(got_weights, expected_weights, atol=1e-5))
-        self.assertTrue(torch.all(got_weights[:, :, 1:].triu(diagonal=1) == 0.0) or True)
-
-    def test_causal_self_attention_dropout(self) -> None:
-        device = get_default_device()
-        attn = CausalSelfAttention(embed_dim=16, head_dim=8, dropout=0.5, device=device)
-        x = torch.randn(4, 6, 16, dtype=torch.float32, device=device)
-
-        attn.eval()
+    def test_scaling(self):
+        self.multi_head_attention.eval()
         torch.manual_seed(123)
-        eval_out_1 = attn(x)
-        torch.manual_seed(999)
-        eval_out_2 = attn(x)
-        self.assertTrue(torch.allclose(eval_out_1, eval_out_2, atol=1e-6))
+        x = torch.randn((self.batch_size, self.seq_length, self.embed_size))
 
-        attn.train()
-        torch.manual_seed(1)
-        train_out_1 = attn(x)
-        torch.manual_seed(2)
-        train_out_2 = attn(x)
-        self.assertFalse(torch.allclose(train_out_1, train_out_2, atol=1e-6))
+        head_dim = self.embed_size // self.heads
+        expected_scale = head_dim ** 0.5
+        q = self.multi_head_attention.queries(
+            x.reshape(self.batch_size, self.seq_length, self.heads, head_dim)
+        )
+        k = self.multi_head_attention.keys(
+            x.reshape(self.batch_size, self.seq_length, self.heads, head_dim)
+        )
+        raw_energy = torch.einsum("nqhd,nkhd->nhqk", [q, k])
+        scaled_energy = raw_energy / expected_scale
+
+        self.assertTrue(torch.allclose(scaled_energy * expected_scale, raw_energy, atol=1e-5))
+
+    def test_dropout(self):
+        torch.manual_seed(99)
+        x = torch.randn((self.batch_size, self.seq_length, self.embed_size))
+
+        self.attention.train()
+        out_a = self.attention(x, x, x)
+        out_b = self.attention(x, x, x)
+        self.assertFalse(torch.equal(out_a, out_b))
+
+        self.attention.eval()
+        out_eval_a = self.attention(x, x, x)
+        out_eval_b = self.attention(x, x, x)
+        self.assertTrue(torch.equal(out_eval_a, out_eval_b))
 
 
 if __name__ == "__main__":

@@ -1,110 +1,70 @@
-from __future__ import annotations
-
+from typing import Optional
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 
 
-def get_default_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        head_dim: int | None = None,
-        dropout: float = 0.0,
-        bias: bool = False,
-        device: torch.device | str | None = None,
-    ) -> None:
+class _BaseAttention(nn.Module):
+    def __init__(self, embed_size: int, heads: int, dropout: float = 0.1, causal: bool = False):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.head_dim = head_dim if head_dim is not None else embed_dim
-        self.scale = self.head_dim ** -0.5
-        target_device = torch.device(device) if device is not None else get_default_device()
+        self.embed_size = embed_size
+        self.heads = heads
+        self.head_dim = embed_size // heads
+        self.causal = causal
 
-        self.q_proj = nn.Linear(embed_dim, self.head_dim, bias=bias)
-        self.k_proj = nn.Linear(embed_dim, self.head_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, self.head_dim, bias=bias)
-        self.out_proj = nn.Linear(self.head_dim, embed_dim, bias=bias)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        self.to(target_device)
+        assert (
+            self.head_dim * heads == embed_size
+        ), "Embedding size needs to be divisible by heads"
 
-    @property
-    def device(self) -> torch.device:
-        return self.q_proj.weight.device
+        self.values = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.keys = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.queries = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
+        self.dropout = nn.Dropout(dropout)
 
-    def compute_attention_scores(self, x: torch.Tensor) -> torch.Tensor:
-        _, seq_len, _ = x.shape
-        x_dev = x.to(device=self.device, dtype=torch.float32)
-        q = self.q_proj(x_dev)
-        k = self.k_proj(x_dev)
-        scores = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(
-            torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        scores = scores.masked_fill(mask, float("-inf"))
-        probs = torch.nan_to_num(F.softmax(scores, dim=-1), nan=0.0)
-        return self.attn_dropout(probs)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_dev = x.to(device=self.device, dtype=torch.float32)
-        v = self.v_proj(x_dev)
-        attn_weights = self.compute_attention_scores(x_dev)
-        context = attn_weights @ v
-        return self.resid_dropout(self.out_proj(context))
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(
+    def forward(
         self,
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        bias: bool = False,
-        device: torch.device | str | None = None,
-    ) -> None:
-        super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError("embed_dim must be divisible by num_heads")
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        target_device = torch.device(device) if device is not None else get_default_device()
+        values: torch.Tensor,
+        keys: torch.Tensor,
+        query: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        N = query.shape[0]
+        value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
 
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        self.to(target_device)
+        values = self.values(values.reshape(N, value_len, self.heads, self.head_dim))
+        keys = self.keys(keys.reshape(N, key_len, self.heads, self.head_dim))
+        queries = self.queries(query.reshape(N, query_len, self.heads, self.head_dim))
 
-    @property
-    def device(self) -> torch.device:
-        return self.qkv_proj.weight.device
+        energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-        x_dev = x.to(device=self.device, dtype=torch.float32)
-        q, k, v = self.qkv_proj(x_dev).chunk(3, dim=-1)
+        if self.causal:
+            causal_mask = torch.tril(
+                torch.ones((query_len, key_len), device=energy.device, dtype=torch.bool),
+                diagonal=key_len - query_len,
+            ).unsqueeze(0).unsqueeze(0)
+            energy = energy.masked_fill(~causal_mask, float("-inf"))
 
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if mask is not None:
+            while mask.ndim < 4:
+                mask = mask.unsqueeze(0)
+            energy = energy.masked_fill(mask.to(energy.device) == 0, float("-inf"))
 
-        scores = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(
-            torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool),
-            diagonal=1,
+        scale = self.head_dim ** 0.5
+        attention = torch.softmax(energy / scale, dim=-1)
+
+        out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
+            N, query_len, self.heads * self.head_dim
         )
-        scores = scores.masked_fill(mask, float("-inf"))
-        probs = torch.nan_to_num(F.softmax(scores, dim=-1), nan=0.0)
-        probs = self.attn_dropout(probs)
+        out = self.fc_out(out)
+        out = self.dropout(out)
+        return out
 
-        context = (probs @ v).transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
-        return self.resid_dropout(self.out_proj(context))
+
+class CausalSelfAttention(_BaseAttention):
+    def __init__(self, embed_size: int, heads: int, dropout: float = 0.1):
+        super().__init__(embed_size=embed_size, heads=heads, dropout=dropout, causal=True)
+
+
+class MultiHeadAttention(_BaseAttention):
+    def __init__(self, embed_size: int, heads: int, dropout: float = 0.1):
+        super().__init__(embed_size=embed_size, heads=heads, dropout=dropout, causal=False)

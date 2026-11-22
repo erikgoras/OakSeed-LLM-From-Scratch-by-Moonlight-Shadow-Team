@@ -1,0 +1,8 @@
+First principles mean starting from what is fundamentally true and building upward.
+Simple, modular components are easier to inspect, test, and reason about over time.
+A character tokenizer maps every symbol to a clear integer index and back again.
+Attention lets each token weigh context from earlier positions in the sequence.
+Small experiments validate assumptions quickly before complexity is allowed to grow.
+Clear contracts between modules keep systems steady when details change.
+Every iteration teaches something practical about architecture, data, and trade-offs.
+Patience and clean structure beat clever shortcuts when building from scratch.
